@@ -188,6 +188,28 @@ func (gateway *Gateway) serve(conn Conn, addr string) error {
 		connRemoteAddr = header.SourceAddr
 	}
 
+	if isLegacyPacket(conn.Reader()) {
+		request, err := readLegacyRequest(conn.Reader())
+		if err != nil {
+			return err
+		}
+
+		proxy, proxyUID, err := gateway.proxyForLegacyRequest(request, addr)
+		if err != nil {
+			return err
+		}
+
+		log.Printf("[i] %s requests legacy proxy with UID %s", connRemoteAddr, proxyUID)
+		if err := proxy.handleLegacyRequest(conn, connRemoteAddr, request); err != nil {
+			proxy.CallbackLogger().LogEvent(callback.ErrorEvent{
+				Error:    err.Error(),
+				ProxyUID: proxyUID,
+			})
+			return err
+		}
+		return nil
+	}
+
 	pk, err := conn.PeekPacket()
 	if err != nil {
 		return err
@@ -216,4 +238,28 @@ func (gateway *Gateway) serve(conn Conn, addr string) error {
 		return err
 	}
 	return nil
+}
+
+func (gateway *Gateway) proxyForLegacyRequest(request legacyRequest, addr string) (*Proxy, string, error) {
+	if request.ServerAddress != "" {
+		proxyUID := proxyUID(request.ServerAddress, addr)
+		v, ok := gateway.Proxies.Load(proxyUID)
+		if ok {
+			return v.(*Proxy), proxyUID, nil
+		}
+	}
+
+	var proxy *Proxy
+	gateway.Proxies.Range(func(_, v interface{}) bool {
+		candidate := v.(*Proxy)
+		if candidate.ListenTo() != addr {
+			return true
+		}
+		proxy = candidate
+		return false
+	})
+	if proxy == nil {
+		return nil, "", errors.New("no proxy for legacy request on " + addr)
+	}
+	return proxy, proxy.UID(), nil
 }

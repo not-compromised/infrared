@@ -1,12 +1,17 @@
 package infrared
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
 	"testing"
+	"time"
+	"unicode/utf16"
 
 	"github.com/haveachin/infrared/protocol"
 	"github.com/haveachin/infrared/protocol/handshaking"
@@ -86,6 +91,26 @@ func serverHandshake(domain string, port int) protocol.Packet {
 		NextState:       1,
 	}
 	return hs.Marshal()
+}
+
+func legacyString(s string) []byte {
+	var buf bytes.Buffer
+	encoded := utf16.Encode([]rune(s))
+	_ = binary.Write(&buf, binary.BigEndian, uint16(len(encoded)))
+	for _, r := range encoded {
+		_ = binary.Write(&buf, binary.BigEndian, r)
+	}
+	return buf.Bytes()
+}
+
+func legacy16Handshake(username, domain string, port uint32) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(0x02)
+	buf.WriteByte(78)
+	buf.Write(legacyString(username))
+	buf.Write(legacyString(domain))
+	_ = binary.Write(&buf, binary.BigEndian, port)
+	return buf.Bytes()
 }
 
 func configToProxies(config *ProxyConfig) []*Proxy {
@@ -463,6 +488,62 @@ func TestProxyProtocol(t *testing.T) {
 			}
 
 		})
+	}
+}
+
+func TestLegacy16HandshakeRoutesToBackend(t *testing.T) {
+	portEnd := 590
+	handshake := legacy16Handshake("LegacyUser", serverDomain, uint32(gatewayPort(portEnd)))
+	receivedCh := make(chan []byte, 1)
+	errorCh := make(chan *testError, 1)
+
+	gateway := Gateway{}
+	if err := gateway.ListenAndServe(configToProxies(proxyConfigWithPortEnd(portEnd))); err != nil {
+		t.Fatalf("Can't start gateway: %v", err)
+	}
+	defer gateway.Close()
+
+	listener, err := Listen(serverAddr(portEnd))
+	if err != nil {
+		t.Fatalf("Can't listen to backend: %v", err)
+	}
+	defer listener.Close()
+
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			errorCh <- &testError{err, "Can't accept backend connection"}
+			return
+		}
+		defer conn.Close()
+
+		received := make([]byte, len(handshake))
+		if _, err := io.ReadFull(conn, received); err != nil {
+			errorCh <- &testError{err, "Can't read legacy handshake from backend connection"}
+			return
+		}
+		receivedCh <- received
+	}()
+
+	conn, err := Dialer{}.Dial(gatewayAddr(portEnd))
+	if err != nil {
+		t.Fatalf("Can't connect to gateway: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write(handshake); err != nil {
+		t.Fatalf("Can't write legacy handshake to gateway: %v", err)
+	}
+
+	select {
+	case err := <-errorCh:
+		t.Fatalf("Unexpected Error in test: %s\n%v", err.Message, err.Error)
+	case received := <-receivedCh:
+		if !bytes.Equal(received, handshake) {
+			t.Fatalf("got: %v; want: %v", received, handshake)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for backend to receive legacy handshake")
 	}
 }
 
