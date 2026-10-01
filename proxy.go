@@ -31,11 +31,22 @@ func proxyUID(domain, addr string) string {
 
 type Proxy struct {
 	Config *ProxyConfig
-
-	cancelTimeoutFunc func()
-	players           map[Conn]string
-	mu                sync.Mutex
 }
+
+// containerState tracks connected players and the idle-stop timer for one
+// managed container. It is shared by every proxy config (hostname alias) that
+// points at the same container, so a timer armed via one alias cannot stop a
+// container that still has players connected via another alias.
+type containerState struct {
+	mu                sync.Mutex
+	players           map[Conn]string
+	cancelTimeoutFunc func()
+}
+
+var (
+	containerStatesMu sync.Mutex
+	containerStates   = map[string]*containerState{}
+)
 
 func (proxy *Proxy) Process() process.Process {
 	proxy.Config.RLock()
@@ -164,24 +175,43 @@ func (proxy *Proxy) UID() string {
 	return proxyUID(proxy.DomainName(), proxy.ListenTo())
 }
 
-func (proxy *Proxy) addPlayer(conn Conn, username string) {
-	proxy.mu.Lock()
-	defer proxy.mu.Unlock()
-	if proxy.players == nil {
-		proxy.players = map[Conn]string{}
+// containerStateKey groups proxies by the container they manage. Proxies
+// without a managed process keep per-proxy state via their UID.
+func (proxy *Proxy) containerStateKey() string {
+	proxy.Config.RLock()
+	defer proxy.Config.RUnlock()
+	name := strings.ToLower(proxy.Config.Docker.ContainerName)
+	if name == "" {
+		return proxyUID(proxy.Config.DomainName, proxy.Config.ListenTo)
 	}
-	proxy.players[conn] = username
+	return "container:" + name
+}
+
+func (proxy *Proxy) containerState() *containerState {
+	key := proxy.containerStateKey()
+	containerStatesMu.Lock()
+	defer containerStatesMu.Unlock()
+	state, ok := containerStates[key]
+	if !ok {
+		state = &containerState{players: map[Conn]string{}}
+		containerStates[key] = state
+	}
+	return state
+}
+
+func (proxy *Proxy) addPlayer(conn Conn, username string) {
+	state := proxy.containerState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.players[conn] = username
 }
 
 func (proxy *Proxy) removePlayer(conn Conn) int {
-	proxy.mu.Lock()
-	defer proxy.mu.Unlock()
-	if proxy.players == nil {
-		proxy.players = map[Conn]string{}
-		return 0
-	}
-	delete(proxy.players, conn)
-	return len(proxy.players)
+	state := proxy.containerState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	delete(state.players, conn)
+	return len(state.players)
 }
 
 func (proxy *Proxy) logEvent(event callback.Event) {
@@ -342,10 +372,31 @@ func (proxy *Proxy) timeoutProcess() {
 		return
 	}
 
-	proxy.cancelProcessTimeout()
+	state := proxy.containerState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	// Players may still be connected through another alias of this container.
+	if len(state.players) > 0 {
+		return
+	}
+
+	if state.cancelTimeoutFunc != nil {
+		state.cancelTimeoutFunc()
+		state.cancelTimeoutFunc = nil
+	}
 
 	log.Printf("[i] Starting container timeout %s on %s", proxy.DockerTimeout(), proxy.UID())
 	timer := time.AfterFunc(proxy.DockerTimeout(), func() {
+		state.mu.Lock()
+		if len(state.players) > 0 {
+			state.mu.Unlock()
+			log.Println("[i] Skipping container stop; players still connected on", proxy.UID())
+			return
+		}
+		state.cancelTimeoutFunc = nil
+		state.mu.Unlock()
+
 		log.Println("[i] Stopping container on", proxy.UID())
 		proxy.logEvent(callback.ContainerStopEvent{ProxyUID: proxy.UID()})
 		if err := proxy.Process().Stop(); err != nil {
@@ -353,7 +404,7 @@ func (proxy *Proxy) timeoutProcess() {
 		}
 	})
 
-	proxy.cancelTimeoutFunc = func() {
+	state.cancelTimeoutFunc = func() {
 		if timer.Stop() {
 			log.Println("[i] Timout stopped for", proxy.UID())
 		}
@@ -361,12 +412,15 @@ func (proxy *Proxy) timeoutProcess() {
 }
 
 func (proxy *Proxy) cancelProcessTimeout() {
-	if proxy.cancelTimeoutFunc == nil {
+	state := proxy.containerState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.cancelTimeoutFunc == nil {
 		return
 	}
 
-	proxy.cancelTimeoutFunc()
-	proxy.cancelTimeoutFunc = nil
+	state.cancelTimeoutFunc()
+	state.cancelTimeoutFunc = nil
 }
 
 func (proxy *Proxy) sniffUsername(conn, rconn Conn, connRemoteAddr net.Addr) (string, error) {
