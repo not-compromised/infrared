@@ -47,7 +47,7 @@ func dialerPort(portEnd int) int {
 }
 
 func portToAddr(port int) string {
-	return fmt.Sprintf(":%d", port)
+	return fmt.Sprintf("127.0.0.1:%d", port)
 }
 
 func routeVersionName(index int) string {
