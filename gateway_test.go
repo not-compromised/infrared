@@ -714,3 +714,347 @@ func TestRouting(t *testing.T) {
 func TestProxyBind(t *testing.T) {
 	// TODO: Figure out a way to test this
 }
+
+// fakeContainer stands in for the Docker container a route wakes and stops.
+type fakeContainer struct {
+	mu      sync.Mutex
+	running bool
+	starts  int
+	stops   int
+}
+
+func (c *fakeContainer) Start() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.running = true
+	c.starts++
+	return nil
+}
+
+func (c *fakeContainer) Stop() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.running = false
+	c.stops++
+	return nil
+}
+
+func (c *fakeContainer) IsRunning() (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.running, nil
+}
+
+func (c *fakeContainer) counts() (starts, stops int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.starts, c.stops
+}
+
+func managedRoute(domain string, portEnd int, backend string, container *fakeContainer, name string, idle time.Duration) *ProxyConfig {
+	config := createBasicProxyConfig(domain, gatewayAddr(portEnd), backend)
+	config.Docker.ContainerName = name
+	config.Docker.Timeout = int(idle / time.Millisecond)
+	config.process = container
+	return config
+}
+
+func startGateway(t *testing.T, configs ...*ProxyConfig) {
+	t.Helper()
+	gateway := Gateway{}
+	if err := gateway.ListenAndServe(configsToProxies(configs)); err != nil {
+		t.Fatalf("Can't start gateway: %v", err)
+	}
+	t.Cleanup(gateway.Close)
+}
+
+// runningBackend accepts and holds connections open, like a running server.
+func runningBackend(t *testing.T, addr string) {
+	t.Helper()
+	listener, err := Listen(addr)
+	if err != nil {
+		t.Fatalf("Can't listen to backend: %v", err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go io.Copy(io.Discard, conn)
+		}
+	}()
+}
+
+func dialGateway(t *testing.T, portEnd int) Conn {
+	t.Helper()
+	conn, err := Dialer{}.Dial(gatewayAddr(portEnd))
+	if err != nil {
+		t.Fatalf("Can't connect to gateway: %v", err)
+	}
+	return conn
+}
+
+// joinAs logs a modern client in through the given hostname and keeps it connected.
+func joinAs(t *testing.T, domain string, portEnd int, username string) Conn {
+	t.Helper()
+	conn := dialGateway(t, portEnd)
+	hs := handshaking.ServerBoundHandshake{
+		ProtocolVersion: 754,
+		ServerAddress:   protocol.String(domain),
+		ServerPort:      protocol.UnsignedShort(gatewayPort(portEnd)),
+		NextState:       handshaking.ServerBoundHandshakeLoginState,
+	}
+	if err := conn.WritePacket(hs.Marshal()); err != nil {
+		t.Fatalf("Can't write login handshake: %v", err)
+	}
+	if err := conn.WritePacket(protocol.MarshalPacket(0x00, protocol.String(username))); err != nil {
+		t.Fatalf("Can't write login start: %v", err)
+	}
+	return conn
+}
+
+// pingOnce sends a server-list ping through the given hostname and hangs up.
+func pingOnce(t *testing.T, domain string, portEnd int) {
+	t.Helper()
+	conn := dialGateway(t, portEnd)
+	defer conn.Close()
+	if err := conn.WritePacket(serverHandshake(domain, gatewayPort(portEnd))); err != nil {
+		t.Fatalf("Can't write status handshake: %v", err)
+	}
+	if err := conn.WritePacket(status.ServerBoundRequest{}.Marshal()); err != nil {
+		t.Fatalf("Can't write status request: %v", err)
+	}
+}
+
+func waitForStops(container *fakeContainer, want int, within time.Duration) int {
+	deadline := time.Now().Add(within)
+	for {
+		_, stops := container.counts()
+		if stops >= want || time.Now().After(deadline) {
+			return stops
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Two hostnames route to one container (live: mc.pmserver.us and the tailnet IP
+// both reach Meat Castle). The container is one server: activity through either
+// alias must keep it awake, and it stops only once nobody is on it.
+func TestSharedAliasPlayerKeepsContainerAwake(t *testing.T) {
+	const idle = 300 * time.Millisecond
+	const settle = 100 * time.Millisecond
+
+	t.Run("ping on one alias does not stop a server with a player on the other", func(t *testing.T) {
+		portEnd := 610
+		container := &fakeContainer{running: true}
+		runningBackend(t, serverAddr(portEnd))
+		startGateway(t,
+			managedRoute("mc.pmserver.test", portEnd, serverAddr(portEnd), container, "mc-shared-ping", idle),
+			managedRoute("100.116.108.52", portEnd, serverAddr(portEnd), container, "mc-shared-ping", idle),
+		)
+
+		player := joinAs(t, "mc.pmserver.test", portEnd, "Steve")
+		time.Sleep(settle)
+		pingOnce(t, "100.116.108.52", portEnd)
+		time.Sleep(3 * idle)
+		if _, stops := container.counts(); stops != 0 {
+			t.Fatalf("container stopped %d time(s) while a player was connected through the other alias", stops)
+		}
+
+		player.Close()
+		if stops := waitForStops(container, 1, 5*idle); stops != 1 {
+			t.Fatalf("container stopped %d time(s) after the last player left; want 1", stops)
+		}
+	})
+
+	t.Run("join on one alias cancels the idle stop armed by the other", func(t *testing.T) {
+		portEnd := 611
+		container := &fakeContainer{running: true}
+		runningBackend(t, serverAddr(portEnd))
+		startGateway(t,
+			managedRoute("mc.pmserver.test", portEnd, serverAddr(portEnd), container, "mc-shared-rejoin", idle),
+			managedRoute("100.116.108.52", portEnd, serverAddr(portEnd), container, "mc-shared-rejoin", idle),
+		)
+
+		first := joinAs(t, "mc.pmserver.test", portEnd, "Steve")
+		time.Sleep(settle)
+		first.Close()
+		time.Sleep(idle / 3)
+		second := joinAs(t, "100.116.108.52", portEnd, "Alex")
+		time.Sleep(3 * idle)
+		if _, stops := container.counts(); stops != 0 {
+			t.Fatalf("container stopped %d time(s) while a player was connected through the other alias", stops)
+		}
+
+		second.Close()
+		if stops := waitForStops(container, 1, 5*idle); stops != 1 {
+			t.Fatalf("container stopped %d time(s) after the last player left; want 1", stops)
+		}
+	})
+}
+
+func legacy16Ping(domain string, port uint32) []byte {
+	var host bytes.Buffer
+	host.WriteByte(78)
+	host.Write(legacyString(domain))
+	_ = binary.Write(&host, binary.BigEndian, port)
+
+	var buf bytes.Buffer
+	buf.Write([]byte{0xfe, 0x01, 0xfa})
+	buf.Write(legacyString("MC|PingHost"))
+	_ = binary.Write(&buf, binary.BigEndian, uint16(host.Len()))
+	buf.Write(host.Bytes())
+	return buf.Bytes()
+}
+
+// readLegacyKick reads the 0xFF kick packet a 1.6 client gets for a ping reply or disconnect.
+func readLegacyKick(conn Conn) (string, error) {
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	var header [3]byte
+	if _, err := io.ReadFull(conn, header[:]); err != nil {
+		return "", err
+	}
+	if header[0] != 0xff {
+		return "", fmt.Errorf("packet id %#x; want 0xff", header[0])
+	}
+	chars := make([]uint16, binary.BigEndian.Uint16(header[1:]))
+	if err := binary.Read(conn, binary.BigEndian, chars); err != nil {
+		return "", err
+	}
+	return string(utf16.Decode(chars)), nil
+}
+
+// recordingBackend reports the first n bytes of every connection the backend receives.
+func recordingBackend(t *testing.T, addr string, n int) <-chan []byte {
+	t.Helper()
+	listener, err := Listen(addr)
+	if err != nil {
+		t.Fatalf("Can't listen to backend: %v", err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	received := make(chan []byte, 16)
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				buf := make([]byte, n)
+				if _, err := io.ReadFull(conn, buf); err == nil {
+					received <- buf
+				}
+			}()
+		}
+	}()
+	return received
+}
+
+func sendLegacy(t *testing.T, portEnd int, packet []byte) Conn {
+	t.Helper()
+	conn := dialGateway(t, portEnd)
+	t.Cleanup(func() { conn.Close() })
+	if _, err := conn.Write(packet); err != nil {
+		t.Fatalf("Can't write legacy packet: %v", err)
+	}
+	return conn
+}
+
+func expectBackendReceives(t *testing.T, received <-chan []byte, want []byte) {
+	t.Helper()
+	select {
+	case got := <-received:
+		if !bytes.Equal(got, want) {
+			t.Fatalf("backend got %v; want %v", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("backend never received the legacy handshake")
+	}
+}
+
+// Minecraft 1.6 clients (Meat Castle) speak the pre-Netty protocol. They must
+// reach the server their hostname names, wake it when it sleeps, and see its
+// server-list status, exactly as modern clients do. Hostname checks repeat
+// because a gateway ignoring the hostname would pick a route at random.
+func TestLegacy16ClientsReachTheirServerByHostname(t *testing.T) {
+	const rounds = 4
+
+	t.Run("login routes by hostname among routes sharing a port", func(t *testing.T) {
+		portEnd := 620
+		mcBackend, sfBackend := serverAddr(620), serverAddr(621)
+		startGateway(t,
+			createBasicProxyConfig("mc.pmserver.test", gatewayAddr(portEnd), mcBackend),
+			createBasicProxyConfig("sf.pmserver.test", gatewayAddr(portEnd), sfBackend),
+		)
+
+		mcHandshake := legacy16Handshake("LegacyUser", "mc.pmserver.test", uint32(gatewayPort(portEnd)))
+		sfHandshake := legacy16Handshake("LegacyUser", "sf.pmserver.test", uint32(gatewayPort(portEnd)))
+		mcReceived := recordingBackend(t, mcBackend, len(mcHandshake))
+		sfReceived := recordingBackend(t, sfBackend, len(sfHandshake))
+		for i := 0; i < rounds; i++ {
+			sendLegacy(t, portEnd, sfHandshake)
+			expectBackendReceives(t, sfReceived, sfHandshake)
+			sendLegacy(t, portEnd, mcHandshake)
+			expectBackendReceives(t, mcReceived, mcHandshake)
+		}
+	})
+
+	t.Run("login with an unconfigured hostname falls back to the port's route", func(t *testing.T) {
+		portEnd := 622
+		startGateway(t, createBasicProxyConfig("mc.pmserver.test", gatewayAddr(portEnd), serverAddr(portEnd)))
+
+		handshake := legacy16Handshake("LegacyUser", "203.0.113.7", uint32(gatewayPort(portEnd)))
+		received := recordingBackend(t, serverAddr(portEnd), len(handshake))
+		sendLegacy(t, portEnd, handshake)
+		expectBackendReceives(t, received, handshake)
+	})
+
+	t.Run("server-list ping shows the named server's status", func(t *testing.T) {
+		portEnd := 623
+		mc := createBasicProxyConfig("mc.pmserver.test", gatewayAddr(portEnd), serverAddr(623))
+		mc.OfflineStatus = StatusConfig{VersionName: "1.6.4", ProtocolNumber: 78, MaxPlayers: 10, MOTD: "Meat Castle is asleep"}
+		sf := createBasicProxyConfig("sf.pmserver.test", gatewayAddr(portEnd), serverAddr(624))
+		sf.OfflineStatus = StatusConfig{VersionName: "1.6.4", ProtocolNumber: 78, MaxPlayers: 10, MOTD: "SkyFactory is asleep"}
+		startGateway(t, mc, sf)
+
+		for i := 0; i < rounds; i++ {
+			for _, route := range []*ProxyConfig{sf, mc} {
+				conn := sendLegacy(t, portEnd, legacy16Ping(route.DomainName, uint32(gatewayPort(portEnd))))
+				reply, err := readLegacyKick(conn)
+				if err != nil {
+					t.Fatalf("no legacy status reply for %s: %v", route.DomainName, err)
+				}
+				fields := strings.Split(reply, "\x00")
+				if len(fields) != 6 || fields[0] != "\u00a71" {
+					t.Fatalf("reply %q is not a 1.6 status response", reply)
+				}
+				if fields[3] != route.OfflineStatus.MOTD {
+					t.Fatalf("%s status MOTD %q; want %q", route.DomainName, fields[3], route.OfflineStatus.MOTD)
+				}
+			}
+		}
+	})
+
+	t.Run("login to a sleeping server wakes it and tells the player", func(t *testing.T) {
+		portEnd := 625
+		container := &fakeContainer{}
+		route := managedRoute("mc.pmserver.test", portEnd, serverAddr(portEnd), container, "mc-legacy-wake", time.Minute)
+		route.DisconnectMessage = "Server is starting"
+		startGateway(t, route)
+
+		conn := sendLegacy(t, portEnd, legacy16Handshake("LegacyUser", "mc.pmserver.test", uint32(gatewayPort(portEnd))))
+		reply, err := readLegacyKick(conn)
+		if err != nil {
+			t.Fatalf("no legacy disconnect: %v", err)
+		}
+		if reply != "Server is starting" {
+			t.Fatalf("disconnect %q; want the configured message", reply)
+		}
+		if starts, _ := container.counts(); starts != 1 {
+			t.Fatalf("container started %d time(s); want 1", starts)
+		}
+	})
+}
