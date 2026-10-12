@@ -1,9 +1,9 @@
-FROM golang:1.16.0-buster AS builder
+FROM golang:1.26.6-alpine AS builder
 LABEL stage=intermediate
 COPY . /infrared
 WORKDIR /infrared/cmd/infrared
 ENV GO111MODULE=on
-RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -a --installsuffix cgo -v -tags netgo -ldflags '-extldflags "-static"' -o /main .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -tags netgo -o /main .
 
 FROM scratch
 LABEL maintainer="Hendrik Jonas Schlehlein <hendrik.schlehlein@gmail.com>"

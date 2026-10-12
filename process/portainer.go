@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/errdefs"
+	"github.com/containerd/errdefs"
+	"github.com/moby/moby/client"
 	"io/ioutil"
 	"net/http"
 )
@@ -33,7 +33,12 @@ func NewPortainer(containerName, address, endpointID, username, password string)
 		client.WithHost(baseURL),
 		client.WithScheme("http"),
 		client.WithAPIVersionNegotiation(),
-		client.WithHTTPHeaders(header),
+		client.WithHTTPRequestHook(func(request *http.Request) error {
+			for key, value := range header {
+				request.Header.Set(key, value)
+			}
+			return nil
+		}),
 	)
 	if err != nil {
 		return nil, err
@@ -103,7 +108,7 @@ func (portainer portainer) IsRunning() (bool, error) {
 }
 
 func isUnauthorized(err error) bool {
-	return errdefs.GetHTTPErrorStatusCode(err) == http.StatusUnauthorized
+	return errdefs.IsUnauthorized(err)
 }
 
 func (portainer *portainer) authenticate() error {
