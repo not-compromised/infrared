@@ -839,9 +839,9 @@ func waitForStops(container *fakeContainer, want int, within time.Duration) int 
 	}
 }
 
-// Two hostnames route to one container (live: mc.pmserver.us and the tailnet IP
-// both reach Meat Castle). The container is one server: activity through either
-// alias must keep it awake, and it stops only once nobody is on it.
+// Two hostnames (a name and a raw IP) route to one container. The container is
+// one server: activity through either alias must keep it awake, and it stops
+// only once nobody is on it.
 func TestSharedAliasPlayerKeepsContainerAwake(t *testing.T) {
 	const idle = 300 * time.Millisecond
 	const settle = 100 * time.Millisecond
@@ -852,12 +852,12 @@ func TestSharedAliasPlayerKeepsContainerAwake(t *testing.T) {
 		runningBackend(t, serverAddr(portEnd))
 		startGateway(t,
 			managedRoute("mc.pmserver.test", portEnd, serverAddr(portEnd), container, "mc-shared-ping", idle),
-			managedRoute("100.116.108.52", portEnd, serverAddr(portEnd), container, "mc-shared-ping", idle),
+			managedRoute("192.0.2.10", portEnd, serverAddr(portEnd), container, "mc-shared-ping", idle),
 		)
 
 		player := joinAs(t, "mc.pmserver.test", portEnd, "Steve")
 		time.Sleep(settle)
-		pingOnce(t, "100.116.108.52", portEnd)
+		pingOnce(t, "192.0.2.10", portEnd)
 		time.Sleep(3 * idle)
 		if _, stops := container.counts(); stops != 0 {
 			t.Fatalf("container stopped %d time(s) while a player was connected through the other alias", stops)
@@ -875,14 +875,14 @@ func TestSharedAliasPlayerKeepsContainerAwake(t *testing.T) {
 		runningBackend(t, serverAddr(portEnd))
 		startGateway(t,
 			managedRoute("mc.pmserver.test", portEnd, serverAddr(portEnd), container, "mc-shared-rejoin", idle),
-			managedRoute("100.116.108.52", portEnd, serverAddr(portEnd), container, "mc-shared-rejoin", idle),
+			managedRoute("192.0.2.10", portEnd, serverAddr(portEnd), container, "mc-shared-rejoin", idle),
 		)
 
 		first := joinAs(t, "mc.pmserver.test", portEnd, "Steve")
 		time.Sleep(settle)
 		first.Close()
 		time.Sleep(idle / 3)
-		second := joinAs(t, "100.116.108.52", portEnd, "Alex")
+		second := joinAs(t, "192.0.2.10", portEnd, "Alex")
 		time.Sleep(3 * idle)
 		if _, stops := container.counts(); stops != 0 {
 			t.Fatalf("container stopped %d time(s) while a player was connected through the other alias", stops)
@@ -975,7 +975,7 @@ func expectBackendReceives(t *testing.T, received <-chan []byte, want []byte) {
 	}
 }
 
-// Minecraft 1.6 clients (Meat Castle) speak the pre-Netty protocol. They must
+// Minecraft 1.6 clients speak the pre-Netty protocol. They must
 // reach the server their hostname names, wake it when it sleeps, and see its
 // server-list status, exactly as modern clients do. Hostname checks repeat
 // because a gateway ignoring the hostname would pick a route at random.
