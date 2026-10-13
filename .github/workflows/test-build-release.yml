@@ -17,7 +17,7 @@ jobs:
     name: Test
     strategy:
       matrix:
-        go-version: [ 1.16.x ]
+        go-version: [ '1.26.9' ]
         os: [ ubuntu-latest, macos-latest, windows-latest ]
     runs-on: ${{ matrix.os }}
     steps:
@@ -129,7 +129,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v2
         with:
-          go-version: 1.16
+          go-version: '1.26.9'
       - name: Run GoReleaser ${{ steps.tag_version.outputs.new_tag }}
         uses: goreleaser/goreleaser-action@v2
         with:
